@@ -20,6 +20,12 @@ Environment variables:
     MATRIX_AUTO_THREAD          Auto-create threads for room messages (default: true)
     MATRIX_RECOVERY_KEY         Recovery key for cross-signing verification after device key rotation
     MATRIX_DM_MENTION_THREADS   Create a thread when bot is @mentioned in a DM (default: false)
+    MATRIX_BRIDGE_PREFIXES      Comma-separated MXID localpart prefixes treated as
+                                bridge / appservice ghost users and dropped before
+                                the pairing flow (default: "@_", the conventional
+                                appservice ghost-user prefix).  Set to "" to disable.
+    MATRIX_BRIDGE_USERS         Comma-separated explicit bridge MXIDs to drop, in
+                                addition to the prefix list.
 """
 
 from __future__ import annotations
@@ -113,6 +119,53 @@ _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
+
+# Default prefix for Matrix appservice "ghost" users created by bridges
+# (Telegram, Discord, IRC, Signal, WhatsApp, Slack, etc.).  Operators can
+# override via MATRIX_BRIDGE_PREFIXES.  See spec:
+# https://spec.matrix.org/v1.10/application-service-api/#namespacing
+_DEFAULT_BRIDGE_PREFIX = "@_"
+
+# Bound on the per-adapter ring of recently-sent Matrix event IDs used to
+# detect "hall of mirrors" relay echoes when our own outbound message is
+# re-emitted as an inbound event (see issue #15763).
+_OUTBOUND_ECHO_RING_SIZE = 512
+
+
+def _parse_bridge_prefixes(raw: Optional[str]) -> tuple[str, ...]:
+    """Parse MATRIX_BRIDGE_PREFIXES into a tuple of lowercase prefixes."""
+    if raw is None:
+        raw = _DEFAULT_BRIDGE_PREFIX
+    return tuple(p.strip().lower() for p in raw.split(",") if p.strip())
+
+
+def _parse_bridge_users(raw: Optional[str]) -> frozenset[str]:
+    """Parse MATRIX_BRIDGE_USERS into a frozenset of lowercase MXIDs."""
+    if not raw:
+        return frozenset()
+    return frozenset(u.strip().lower() for u in raw.split(",") if u.strip())
+
+
+def is_matrix_bridge_sender(
+    sender: str,
+    *,
+    prefixes: tuple[str, ...],
+    users: frozenset[str],
+) -> bool:
+    """Return True when ``sender`` is a Matrix bridge / appservice ghost user.
+
+    Matrix application services (Telegram, IRC, Signal, … bridges) puppet
+    remote users via MXIDs in their declared namespace.  Such senders deliver
+    system-level events (status notices, "interruption" relays, etc.) that
+    must not trigger the gateway's pairing flow nor be processed as user
+    turns — see issue #15763.
+    """
+    if not sender:
+        return False
+    norm = sender.lower()
+    if norm in users:
+        return True
+    return any(prefix and norm.startswith(prefix) for prefix in prefixes)
 
 
 _E2EE_INSTALL_HINT = (
@@ -264,6 +317,26 @@ class MatrixAdapter(BasePlatformAdapter):
             "MATRIX_DM_MENTION_THREADS", "false"
         ).lower() in ("true", "1", "yes")
 
+        # Bridge / appservice ghost-user filter (issue #15763).  Parsed once;
+        # _on_room_message and the gateway runner consult these to drop
+        # system-level events before they trigger the pairing flow.
+        self._bridge_prefixes: tuple[str, ...] = _parse_bridge_prefixes(
+            os.getenv("MATRIX_BRIDGE_PREFIXES")
+        )
+        self._bridge_users: frozenset[str] = _parse_bridge_users(
+            os.getenv("MATRIX_BRIDGE_USERS", "")
+        )
+
+        # Ring of recently-sent event IDs.  When a bridge or relay re-emits
+        # our own outbound message as an inbound event (issue #15763), the
+        # event ID matches one we just sent — drop it instead of looping.
+        from collections import deque
+
+        self._recent_outbound_event_ids: deque = deque(
+            maxlen=_OUTBOUND_ECHO_RING_SIZE
+        )
+        self._recent_outbound_event_ids_set: set[str] = set()
+
         # Reactions: configurable via MATRIX_REACTIONS (default: true).
         self._reactions_enabled: bool = os.getenv(
             "MATRIX_REACTIONS", "true"
@@ -293,6 +366,18 @@ class MatrixAdapter(BasePlatformAdapter):
         self._processed_events.append(event_id)
         self._processed_events_set.add(event_id)
         return False
+
+    def _record_outbound_event_id(self, event_id: Optional[str]) -> None:
+        """Remember an event ID we just sent, for relay-echo detection."""
+        if not event_id:
+            return
+        if event_id in self._recent_outbound_event_ids_set:
+            return
+        ring = self._recent_outbound_event_ids
+        if len(ring) == ring.maxlen:
+            self._recent_outbound_event_ids_set.discard(ring[0])
+        ring.append(event_id)
+        self._recent_outbound_event_ids_set.add(event_id)
 
     # ------------------------------------------------------------------
     # E2EE helpers
@@ -764,6 +849,7 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=45,
                 )
                 last_event_id = str(event_id)
+                self._record_outbound_event_id(last_event_id)
                 logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             except Exception as exc:
                 # On E2EE errors, retry after sharing keys.
@@ -779,6 +865,7 @@ class MatrixAdapter(BasePlatformAdapter):
                             timeout=45,
                         )
                         last_event_id = str(event_id)
+                        self._record_outbound_event_id(last_event_id)
                         logger.info(
                             "Matrix: sent event %s to %s (after key share)",
                             last_event_id,
@@ -1190,6 +1277,28 @@ class MatrixAdapter(BasePlatformAdapter):
         # Deduplicate by event ID.
         event_id = str(getattr(event, "event_id", ""))
         if self._is_duplicate_event(event_id):
+            return
+
+        # Drop bridge / appservice ghost users before the gateway sees them
+        # (issue #15763).  Bridges relay system-level events (status notices,
+        # interruption echoes) that have valid but unauthorized MXIDs and would
+        # otherwise trigger pairing.
+        if is_matrix_bridge_sender(
+            sender, prefixes=self._bridge_prefixes, users=self._bridge_users
+        ):
+            logger.debug("Matrix: ignoring bridge sender %s in %s", sender, room_id)
+            return
+
+        # Drop "hall of mirrors" relay echoes — events whose ID matches one
+        # we just sent (issue #15763).  Some bridges and relay setups
+        # re-emit our outbound messages back into the room.
+        if event_id and event_id in self._recent_outbound_event_ids_set:
+            logger.debug(
+                "Matrix: ignoring outbound echo of %s from %s in %s",
+                event_id,
+                sender,
+                room_id,
+            )
             return
 
         # Startup grace: ignore old messages from initial sync.

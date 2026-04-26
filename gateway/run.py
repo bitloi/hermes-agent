@@ -2982,6 +2982,35 @@ class GatewayRunner:
 
         return bool(check_ids & allowed_ids)
 
+    def _is_system_identity(self, source: SessionSource) -> bool:
+        """Return True when ``source`` is a platform-level system / bridge identity.
+
+        Such senders (Matrix appservice ghost users, bridges, …) carry
+        valid-looking but unauthorized user IDs and would otherwise trigger
+        the pairing flow and, once approved, fuel "hall of mirrors" relay
+        loops where the gateway's own outbound traffic comes back as
+        inbound events (issue #15763).
+        """
+        if not source or not source.user_id:
+            return False
+        if source.platform == Platform.MATRIX:
+            from gateway.platforms.matrix import (
+                _parse_bridge_prefixes,
+                _parse_bridge_users,
+                is_matrix_bridge_sender,
+            )
+            adapter = self.adapters.get(Platform.MATRIX)
+            prefixes = getattr(adapter, "_bridge_prefixes", None)
+            users = getattr(adapter, "_bridge_users", None)
+            if prefixes is None:
+                prefixes = _parse_bridge_prefixes(os.getenv("MATRIX_BRIDGE_PREFIXES"))
+            if users is None:
+                users = _parse_bridge_users(os.getenv("MATRIX_BRIDGE_USERS", ""))
+            return is_matrix_bridge_sender(
+                source.user_id, prefixes=prefixes, users=users
+            )
+        return False
+
     def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
@@ -3106,6 +3135,18 @@ class GatewayRunner:
             # authorized — drop silently instead of triggering the pairing
             # flow with a None user_id.
             logger.debug("Ignoring message with no user_id from %s", source.platform.value)
+            return None
+        elif self._is_system_identity(source):
+            # Platform-level system / bridge identities (e.g. Matrix
+            # appservice ghost users) carry valid-looking MXIDs but must
+            # not trigger pairing nor be processed as user turns — see
+            # issue #15763.  Placed before the auth check so an
+            # accidentally-paired bridge user is still dropped.
+            logger.debug(
+                "Ignoring system/bridge identity %s on %s",
+                source.user_id,
+                source.platform.value,
+            )
             return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
