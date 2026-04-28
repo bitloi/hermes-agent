@@ -32,7 +32,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
-from tools import file_state
+from tools import file_state, side_effects
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
 
@@ -539,6 +539,8 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    verify_side_effects: bool = False,
+    expected_side_effects: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -560,6 +562,25 @@ def _build_child_system_prompt(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
+    if verify_side_effects:
+        expected = expected_side_effects or []
+        expected_text = ""
+        if expected:
+            expected_text = (
+                "\nExpected side effects to match:\n"
+                f"{json.dumps(expected, ensure_ascii=False)}\n"
+            )
+        parts.append(
+            "\nSIDE-EFFECT VERIFICATION:\n"
+            "The parent requested structural verification for external effects. "
+            "Whenever you create or mutate an external resource (file_write, url, "
+            "http_post, remote_write), call `record_side_effect` with a concrete "
+            "handle such as an absolute path, public verification URL, status, "
+            "sha256, byte count, or expected marker. Do this before your final "
+            "summary, and do not claim the side effect succeeded unless the "
+            "recorded handle supports that claim."
+            f"{expected_text}"
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
@@ -853,6 +874,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    verify_side_effects: bool = False,
+    expected_side_effects: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -928,6 +951,8 @@ def _build_child_agent(
     # test_intersection_preserves_delegation_bound test for the design rationale.
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
+    if verify_side_effects and "side_effects" not in child_toolsets:
+        child_toolsets.append("side_effects")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(
@@ -937,6 +962,8 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        verify_side_effects=verify_side_effects,
+        expected_side_effects=expected_side_effects,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1247,6 +1274,9 @@ def _run_single_child(
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
+    verify_requested = is_truthy_value(_kwargs.get("verify_side_effects"), default=False)
+    expected_side_effects = _kwargs.get("expected_side_effects") or []
+    child_task_id: Optional[str] = None
 
     # Restore parent tool names using the value saved before child construction
     # mutated the global. This is the correct parent toolset, not the child's.
@@ -1633,6 +1663,27 @@ def _run_single_child(
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
+        if verify_requested:
+            verification = side_effects.verify_side_effects(
+                child_task_id,
+                expected_side_effects,
+            )
+            checked_effects = verification.pop("side_effects")
+            entry["side_effects"] = checked_effects
+            entry["side_effect_verification"] = verification
+            verification_status = verification.get("status")
+            if entry.get("status") == "completed" and verification_status != "verified":
+                entry["status"] = "completed_unverified"
+            if verification_status != "verified":
+                note = (
+                    "\n\n[SIDE EFFECT VERIFICATION: "
+                    f"{verification_status}; {verification.get('message')}]"
+                )
+                if entry.get("summary"):
+                    entry["summary"] = entry["summary"] + note
+                else:
+                    entry["summary"] = note.strip()
+
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent
         # knows to re-read before editing — the scenario that motivated
@@ -1770,6 +1821,9 @@ def _run_single_child(
             except Exception as exc:
                 logger.debug("Failed to release credential lease: %s", exc)
 
+        if verify_requested and child_task_id:
+            side_effects.get_registry().clear(child_task_id)
+
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -1811,6 +1865,8 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    verify_side_effects: Optional[bool] = None,
+    expected_side_effects: Optional[List[Dict[str, Any]]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -1841,6 +1897,10 @@ def delegate_task(
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
+    top_verify_side_effects = is_truthy_value(verify_side_effects, default=False)
+    top_expected_side_effects = (
+        expected_side_effects if isinstance(expected_side_effects, list) else []
+    )
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -1898,7 +1958,14 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [
-            {"goal": goal, "context": context, "toolsets": toolsets, "role": top_role}
+            {
+                "goal": goal,
+                "context": context,
+                "toolsets": toolsets,
+                "role": top_role,
+                "verify_side_effects": top_verify_side_effects,
+                "expected_side_effects": top_expected_side_effects,
+            }
         ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
@@ -1935,6 +2002,15 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            task_verify_side_effects = is_truthy_value(
+                t.get("verify_side_effects"),
+                default=top_verify_side_effects,
+            )
+            task_expected_side_effects = (
+                t.get("expected_side_effects")
+                if isinstance(t.get("expected_side_effects"), list)
+                else top_expected_side_effects
+            )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -1957,6 +2033,8 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                verify_side_effects=task_verify_side_effects,
+                expected_side_effects=task_expected_side_effects,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -1968,7 +2046,21 @@ def delegate_task(
     if n_tasks == 1:
         # Single task -- run directly (no thread pool overhead)
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
+        result = _run_single_child(
+            0,
+            _t["goal"],
+            child,
+            parent_agent,
+            verify_side_effects=is_truthy_value(
+                _t.get("verify_side_effects"),
+                default=top_verify_side_effects,
+            ),
+            expected_side_effects=(
+                _t.get("expected_side_effects")
+                if isinstance(_t.get("expected_side_effects"), list)
+                else top_expected_side_effects
+            ),
+        )
         results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
@@ -1984,6 +2076,15 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    verify_side_effects=is_truthy_value(
+                        t.get("verify_side_effects"),
+                        default=top_verify_side_effects,
+                    ),
+                    expected_side_effects=(
+                        t.get("expected_side_effects")
+                        if isinstance(t.get("expected_side_effects"), list)
+                        else top_expected_side_effects
+                    ),
                 )
                 futures[future] = i
 
@@ -2417,6 +2518,39 @@ DELEGATE_TASK_SCHEMA = {
                     "['terminal', 'file', 'web'] for full-stack tasks."
                 ),
             },
+            "verify_side_effects": {
+                "type": "boolean",
+                "description": (
+                    "Opt in when the delegated task is expected to create or "
+                    "mutate external state (upload, publish, remote write, "
+                    "shared-path file write). The child receives a "
+                    "record_side_effect tool and delegate_task returns a "
+                    "side_effect_verification object with parent-side checks."
+                ),
+            },
+            "expected_side_effects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "path": {"type": "string"},
+                        "url": {"type": "string"},
+                        "verify_url": {"type": "string"},
+                        "target": {"type": "string"},
+                        "bytes": {"type": "integer"},
+                        "min_bytes": {"type": "integer"},
+                        "sha256": {"type": "string"},
+                        "contains": {"type": "string"},
+                        "expected_status": {"type": "integer"},
+                    },
+                },
+                "description": (
+                    "Optional expected side effects the child should record "
+                    "for verification, e.g. {'kind':'file_write','path':'/abs/file'} "
+                    "or {'kind':'url','url':'https://...','contains':'done'}."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -2431,6 +2565,29 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": f"Toolsets for this specific task. Available: {_TOOLSET_LIST_STR}. Use 'web' for network access, 'terminal' for shell, 'browser' for web interaction.",
+                        },
+                        "verify_side_effects": {
+                            "type": "boolean",
+                            "description": "Per-task override for opt-in side-effect verification.",
+                        },
+                        "expected_side_effects": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"type": "string"},
+                                    "path": {"type": "string"},
+                                    "url": {"type": "string"},
+                                    "verify_url": {"type": "string"},
+                                    "target": {"type": "string"},
+                                    "bytes": {"type": "integer"},
+                                    "min_bytes": {"type": "integer"},
+                                    "sha256": {"type": "string"},
+                                    "contains": {"type": "string"},
+                                    "expected_status": {"type": "integer"},
+                                },
+                            },
+                            "description": "Per-task expected side effects to record and verify.",
                         },
                         "acp_command": {
                             "type": "string",
@@ -2510,6 +2667,8 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        verify_side_effects=args.get("verify_side_effects"),
+        expected_side_effects=args.get("expected_side_effects"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

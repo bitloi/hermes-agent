@@ -8605,6 +8605,8 @@ class AIAgent:
             acp_command=function_args.get("acp_command"),
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
+            verify_side_effects=function_args.get("verify_side_effects"),
+            expected_side_effects=function_args.get("expected_side_effects"),
             parent_agent=self,
         )
 

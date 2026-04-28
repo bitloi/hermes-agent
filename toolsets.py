@@ -193,6 +193,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "side_effects": {
+        "description": "Record delegated side-effect manifests for parent verification",
+        "tools": ["record_side_effect"],
+        "includes": []
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
