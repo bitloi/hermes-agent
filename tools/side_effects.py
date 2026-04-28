@@ -34,6 +34,13 @@ _FIELD_LIMITS = {
 _SUPPORTED_FILE_KINDS = {"file_write"}
 _REMOTE_MUTATION_KINDS = {"http_post", "http_put", "remote_write"}
 _SUPPORTED_URL_KINDS = {"url", "http_resource"} | _REMOTE_MUTATION_KINDS
+_CONSTRAINT_FIELDS = (
+    "bytes",
+    "min_bytes",
+    "sha256",
+    "contains",
+    "expected_status",
+)
 _ALLOWED_FIELDS = {
     "kind",
     "path",
@@ -131,19 +138,12 @@ def verify_side_effects(
 
     for effect in effects:
         checked = dict(effect)
-        verification_input = dict(effect)
-        for expected_effect in expected:
-            if _matches_expected(effect, expected_effect):
-                for key in (
-                    "bytes",
-                    "min_bytes",
-                    "sha256",
-                    "contains",
-                    "expected_status",
-                ):
-                    if key in expected_effect and key not in verification_input:
-                        verification_input[key] = expected_effect[key]
-        verification = _verify_one(verification_input)
+        matching_expected = [
+            expected_effect
+            for expected_effect in expected
+            if _matches_expected(effect, expected_effect)
+        ]
+        verification = _verify_with_expected_constraints(effect, matching_expected)
         checked["verification"] = verification
         counts[verification["status"]] += 1
         verified_effects.append(checked)
@@ -222,6 +222,63 @@ def _verify_one(effect: Dict[str, Any]) -> Dict[str, str]:
     }
 
 
+def _verify_with_expected_constraints(
+    effect: Dict[str, Any], matching_expected: Iterable[Dict[str, Any]]
+) -> Dict[str, str]:
+    expected_items = list(matching_expected)
+    recorded_input = dict(effect)
+    for expected_effect in expected_items:
+        if (
+            "expected_status" in expected_effect
+            and "expected_status" not in recorded_input
+        ):
+            recorded_input["expected_status"] = expected_effect["expected_status"]
+            break
+
+    checks = [_verify_one(recorded_input)]
+    for expected_effect in expected_items:
+        expected_input = dict(effect)
+        for key in _CONSTRAINT_FIELDS:
+            if key in expected_effect:
+                expected_input[key] = expected_effect[key]
+        checks.append(_verify_one(expected_input))
+
+    return _combine_verification_results(checks)
+
+
+def _combine_verification_results(checks: List[Dict[str, str]]) -> Dict[str, str]:
+    for index, check in enumerate(checks):
+        if check.get("status") == "failed":
+            if index:
+                return {
+                    "status": "failed",
+                    "reason": f"Expected side-effect constraint failed: {check.get('reason')}",
+                }
+            return check
+    expected_checks = checks[1:]
+    if expected_checks:
+        for check in expected_checks:
+            if check.get("status") == "unverified":
+                return {
+                    "status": "unverified",
+                    "reason": f"Expected side-effect constraint unverified: {check.get('reason')}",
+                }
+        if all(check.get("status") == "verified" for check in expected_checks):
+            recorded = checks[0]
+            if recorded.get("status") == "unverified":
+                return expected_checks[0]
+            return recorded
+    for index, check in enumerate(checks):
+        if check.get("status") == "unverified":
+            if index:
+                return {
+                    "status": "unverified",
+                    "reason": f"Expected side-effect constraint unverified: {check.get('reason')}",
+                }
+            return check
+    return checks[0] if checks else {"status": "unverified", "reason": "No check ran."}
+
+
 def _verify_file_write(effect: Dict[str, Any]) -> Dict[str, str]:
     path_value = str(effect.get("path") or "").strip()
     if not path_value:
@@ -277,12 +334,20 @@ def _verify_file_write(effect: Dict[str, Any]) -> Dict[str, str]:
 
 def _verify_url_effect(effect: Dict[str, Any]) -> Dict[str, str]:
     kind = str(effect.get("kind") or "").lower()
+    expected_status = _as_int(effect.get("expected_status"))
     recorded_status = _as_int(effect.get("status"))
-    if recorded_status is not None and not (200 <= recorded_status < 300):
-        return {
-            "status": "failed",
-            "reason": f"Recorded HTTP status {recorded_status} was not successful.",
-        }
+    if recorded_status is not None:
+        if expected_status is not None:
+            if recorded_status != expected_status:
+                return {
+                    "status": "failed",
+                    "reason": f"Recorded HTTP status {recorded_status} did not match expected {expected_status}.",
+                }
+        elif not (200 <= recorded_status < 300):
+            return {
+                "status": "failed",
+                "reason": f"Recorded HTTP status {recorded_status} was not successful.",
+            }
 
     url = str(effect.get("verify_url") or effect.get("url") or "").strip()
     if kind in _REMOTE_MUTATION_KINDS:
@@ -327,7 +392,6 @@ def _verify_url_effect(effect: Dict[str, Any]) -> Dict[str, str]:
     except Exception as exc:
         return {"status": "failed", "reason": f"Verification request failed: {exc}"}
 
-    expected_status = _as_int(effect.get("expected_status"))
     if expected_status is not None:
         if status != expected_status:
             return {

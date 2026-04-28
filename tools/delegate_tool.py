@@ -1430,6 +1430,31 @@ def _run_single_child(
             list(file_state.known_reads(parent_task_id)) if parent_task_id else []
         )
 
+        def _attach_side_effect_verification(
+            entry: Dict[str, Any], annotate_summary: bool = True
+        ) -> None:
+            if not verify_requested:
+                return
+            verification = side_effects.verify_side_effects(
+                child_task_id,
+                expected_side_effects,
+            )
+            checked_effects = verification.pop("side_effects")
+            entry["side_effects"] = checked_effects
+            entry["side_effect_verification"] = verification
+            verification_status = verification.get("status")
+            if entry.get("status") == "completed" and verification_status != "verified":
+                entry["status"] = "completed_unverified"
+            if annotate_summary and verification_status != "verified":
+                note = (
+                    "\n\n[SIDE EFFECT VERIFICATION: "
+                    f"{verification_status}; {verification.get('message')}]"
+                )
+                if entry.get("summary"):
+                    entry["summary"] = entry["summary"] + note
+                else:
+                    entry["summary"] = note.strip()
+
         # Run child with a hard timeout to prevent indefinite blocking
         # when the child's API call or tool-level HTTP request hangs.
         child_timeout = _get_child_timeout()
@@ -1536,7 +1561,7 @@ def _run_single_child(
             else:
                 _err = str(_timeout_exc)
 
-            return {
+            entry = {
                 "task_index": task_index,
                 "status": "timeout" if is_timeout else "error",
                 "summary": None,
@@ -1547,6 +1572,8 @@ def _run_single_child(
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
             }
+            _attach_side_effect_verification(entry, annotate_summary=False)
+            return entry
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -1663,26 +1690,7 @@ def _run_single_child(
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
-        if verify_requested:
-            verification = side_effects.verify_side_effects(
-                child_task_id,
-                expected_side_effects,
-            )
-            checked_effects = verification.pop("side_effects")
-            entry["side_effects"] = checked_effects
-            entry["side_effect_verification"] = verification
-            verification_status = verification.get("status")
-            if entry.get("status") == "completed" and verification_status != "verified":
-                entry["status"] = "completed_unverified"
-            if verification_status != "verified":
-                note = (
-                    "\n\n[SIDE EFFECT VERIFICATION: "
-                    f"{verification_status}; {verification.get('message')}]"
-                )
-                if entry.get("summary"):
-                    entry["summary"] = entry["summary"] + note
-                else:
-                    entry["summary"] = note.strip()
+        _attach_side_effect_verification(entry)
 
         # Cross-agent file-state reminder.  If this subagent wrote any
         # files the parent had already read, surface it so the parent

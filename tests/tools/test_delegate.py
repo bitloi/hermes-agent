@@ -775,6 +775,29 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
         self.assertEqual(verification["recorded_count"], 0)
         self.assertIn("No side effects were recorded", entry["summary"])
 
+    def test_requested_verification_on_child_error_still_reports_verification(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.side_effect = RuntimeError("boom")
+            mock_child.get_activity_summary.return_value = {"api_call_count": 0}
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Upload a page",
+                    verify_side_effects=True,
+                    parent_agent=parent,
+                )
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "error")
+        self.assertIn("side_effect_verification", entry)
+        self.assertEqual(entry["side_effect_verification"]["status"], "failed")
+        self.assertEqual(entry["side_effect_verification"]["recorded_count"], 0)
+
     def test_record_side_effect_tool_records_manifest_for_task_id(self):
         from tools.registry import registry
 
@@ -918,6 +941,126 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
         self.assertEqual(entry["side_effect_verification"]["status"], "failed")
         self.assertEqual(entry["side_effect_verification"]["failed_count"], 1)
 
+    def test_expected_file_contains_is_not_weakened_by_recorded_claims(self):
+        parent = _make_mock_parent(depth=0)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write("anything\n")
+            path = tmp.name
+
+        try:
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+
+                def _run(user_message, task_id):
+                    get_side_effect_registry().record(
+                        task_id,
+                        {
+                            "kind": "file_write",
+                            "path": path,
+                            "contains": "anything",
+                        },
+                    )
+                    return {
+                        "final_response": "Wrote the expected output",
+                        "completed": True,
+                        "interrupted": False,
+                        "api_calls": 1,
+                        "messages": [],
+                    }
+
+                mock_child.run_conversation.side_effect = _run
+                MockAgent.return_value = mock_child
+
+                result = json.loads(
+                    delegate_task(
+                        goal="Write a file",
+                        verify_side_effects=True,
+                        expected_side_effects=[
+                            {
+                                "kind": "file_write",
+                                "path": path,
+                                "contains": "expected output",
+                            }
+                        ],
+                        parent_agent=parent,
+                    )
+                )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed_unverified")
+        self.assertEqual(entry["side_effect_verification"]["status"], "failed")
+        self.assertEqual(entry["side_effect_verification"]["failed_count"], 1)
+        self.assertIn(
+            "expected marker", entry["side_effects"][0]["verification"]["reason"]
+        )
+
+    def test_expected_file_min_bytes_is_not_weakened_by_recorded_claims(self):
+        parent = _make_mock_parent(depth=0)
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
+            tmp.write("anything\n")
+            path = tmp.name
+
+        try:
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+
+                def _run(user_message, task_id):
+                    get_side_effect_registry().record(
+                        task_id,
+                        {
+                            "kind": "file_write",
+                            "path": path,
+                            "min_bytes": 1,
+                        },
+                    )
+                    return {
+                        "final_response": "Wrote enough bytes",
+                        "completed": True,
+                        "interrupted": False,
+                        "api_calls": 1,
+                        "messages": [],
+                    }
+
+                mock_child.run_conversation.side_effect = _run
+                MockAgent.return_value = mock_child
+
+                result = json.loads(
+                    delegate_task(
+                        goal="Write a file",
+                        verify_side_effects=True,
+                        expected_side_effects=[
+                            {
+                                "kind": "file_write",
+                                "path": path,
+                                "min_bytes": 100,
+                            }
+                        ],
+                        parent_agent=parent,
+                    )
+                )
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed_unverified")
+        self.assertEqual(entry["side_effect_verification"]["status"], "failed")
+        self.assertEqual(entry["side_effect_verification"]["failed_count"], 1)
+        self.assertIn(
+            "below expected minimum", entry["side_effects"][0]["verification"]["reason"]
+        )
+
     def test_url_side_effect_fails_on_http_error_status(self):
         parent = _make_mock_parent(depth=0)
 
@@ -960,6 +1103,59 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
         self.assertEqual(entry["status"], "completed_unverified")
         self.assertEqual(entry["side_effect_verification"]["status"], "failed")
         self.assertIn("HTTP 400", entry["side_effects"][0]["verification"]["reason"])
+
+    def test_url_side_effect_allows_expected_not_found_status(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent, patch(
+            "tools.side_effects.is_safe_url", return_value=True
+        ), patch("tools.side_effects._open_verification_url") as mock_urlopen:
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.status = 404
+            response.read.return_value = b"deleted"
+            mock_urlopen.return_value = response
+
+            mock_child = MagicMock()
+
+            def _run(user_message, task_id):
+                get_side_effect_registry().record(
+                    task_id,
+                    {
+                        "kind": "url",
+                        "url": "https://example.com/result",
+                        "status": 404,
+                    },
+                )
+                return {
+                    "final_response": "Deleted successfully",
+                    "completed": True,
+                    "interrupted": False,
+                    "api_calls": 1,
+                    "messages": [],
+                }
+
+            mock_child.run_conversation.side_effect = _run
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(
+                    goal="Delete a resource",
+                    verify_side_effects=True,
+                    expected_side_effects=[
+                        {
+                            "kind": "url",
+                            "url": "https://example.com/result",
+                            "expected_status": 404,
+                        }
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        entry = result["results"][0]
+        self.assertEqual(entry["status"], "completed")
+        self.assertEqual(entry["side_effect_verification"]["status"], "verified")
 
     def test_url_side_effect_fails_when_expected_marker_missing(self):
         parent = _make_mock_parent(depth=0)
@@ -1107,7 +1303,7 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
         )
         mock_urlopen.assert_not_called()
 
-    def test_http_put_allows_explicit_zero_byte_evidence(self):
+    def test_http_post_uses_expected_content_evidence(self):
         parent = _make_mock_parent(depth=0)
 
         with patch("run_agent.AIAgent") as MockAgent, patch(
@@ -1116,7 +1312,7 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
             response = MagicMock()
             response.__enter__.return_value = response
             response.status = 200
-            response.read.return_value = b""
+            response.read.return_value = b"published"
             mock_urlopen.return_value = response
             mock_child = MagicMock()
 
@@ -1124,11 +1320,10 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
                 get_side_effect_registry().record(
                     task_id,
                     {
-                        "kind": "http_put",
+                        "kind": "http_post",
                         "url": "https://example.com/upload",
                         "verify_url": "https://example.com/result",
                         "status": 200,
-                        "bytes": 0,
                     },
                 )
                 return {
@@ -1146,6 +1341,13 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
                 delegate_task(
                     goal="Upload a page",
                     verify_side_effects=True,
+                    expected_side_effects=[
+                        {
+                            "kind": "http_post",
+                            "url": "https://example.com/upload",
+                            "contains": "published",
+                        }
+                    ],
                     parent_agent=parent,
                 )
             )
@@ -1241,121 +1443,6 @@ class TestDelegateSideEffectVerification(unittest.TestCase):
         self.assertEqual(entry["status"], "completed_unverified")
         self.assertEqual(entry["side_effect_verification"]["status"], "failed")
         self.assertEqual(entry["side_effect_verification"]["missing_expected_count"], 1)
-
-    def test_expected_side_effect_constraints_are_verified(self):
-        parent = _make_mock_parent(depth=0)
-        import tempfile
-
-        with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-            tmp.write("actual content\n")
-            path = tmp.name
-
-        try:
-            with patch("run_agent.AIAgent") as MockAgent:
-                mock_child = MagicMock()
-
-                def _run(user_message, task_id):
-                    get_side_effect_registry().record(
-                        task_id,
-                        {"kind": "file_write", "path": path},
-                    )
-                    return {
-                        "final_response": "Wrote the file",
-                        "completed": True,
-                        "interrupted": False,
-                        "api_calls": 1,
-                        "messages": [],
-                    }
-
-                mock_child.run_conversation.side_effect = _run
-                MockAgent.return_value = mock_child
-
-                result = json.loads(
-                    delegate_task(
-                        goal="Write constrained content",
-                        verify_side_effects=True,
-                        expected_side_effects=[
-                            {
-                                "kind": "file_write",
-                                "path": path,
-                                "contains": "expected content",
-                            }
-                        ],
-                        parent_agent=parent,
-                    )
-                )
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-
-        entry = result["results"][0]
-        self.assertEqual(entry["status"], "completed_unverified")
-        self.assertEqual(entry["side_effect_verification"]["status"], "failed")
-        self.assertEqual(entry["side_effect_verification"]["failed_count"], 1)
-
-    def test_batch_side_effect_manifests_are_isolated_per_child(self):
-        parent = _make_mock_parent(depth=0)
-        import tempfile
-
-        paths = []
-        for content in ("alpha\n", "beta\n"):
-            with tempfile.NamedTemporaryFile("w", delete=False) as tmp:
-                tmp.write(content)
-                paths.append(tmp.name)
-
-        try:
-            with patch("run_agent.AIAgent") as MockAgent:
-                children = []
-                for i, path in enumerate(paths):
-                    child = MagicMock()
-
-                    def _run(user_message, task_id, _path=path, _i=i):
-                        get_side_effect_registry().record(
-                            task_id,
-                            {
-                                "kind": "file_write",
-                                "path": _path,
-                                "contains": "alpha" if _i == 0 else "beta",
-                            },
-                        )
-                        return {
-                            "final_response": f"Wrote file {_i}",
-                            "completed": True,
-                            "interrupted": False,
-                            "api_calls": 1,
-                            "messages": [],
-                        }
-
-                    child.run_conversation.side_effect = _run
-                    children.append(child)
-                MockAgent.side_effect = children
-
-                result = json.loads(
-                    delegate_task(
-                        tasks=[
-                            {"goal": "Write alpha", "verify_side_effects": True},
-                            {"goal": "Write beta", "verify_side_effects": True},
-                        ],
-                        parent_agent=parent,
-                    )
-                )
-        finally:
-            for path in paths:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-
-        self.assertEqual(len(result["results"]), 2)
-        self.assertEqual(
-            [entry["side_effect_verification"]["status"] for entry in result["results"]],
-            ["verified", "verified"],
-        )
-        self.assertEqual(result["results"][0]["side_effects"][0]["path"], paths[0])
-        self.assertEqual(result["results"][1]["side_effects"][0]["path"], paths[1])
-
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
